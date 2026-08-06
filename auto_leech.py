@@ -18,6 +18,8 @@ import logging
 import time
 import aiohttp
 import tempfile
+import zipfile
+import shutil
 
 from pyrogram import Client
 
@@ -267,6 +269,220 @@ async def copy_to_auto_leech_channel(client: Client, sent_msg, caption: str) -> 
         return False
 
 
+# ─── ZIP Handler ─────────────────────────────────────────────────────────────
+
+async def handle_zip_upload(
+    client: Client,
+    zip_path: str,
+    post: dict,
+    quality: str,
+    size: str,
+    thumb_path: str | None,
+    safe_edit,          # leech_one_link ka safe_edit pass hoga
+) -> list:
+    """
+    ZIP file ko extract karke saari files upload karo.
+
+    Flow:
+      1. ZIP valid hai ya nahi check karo
+      2. Ek temp folder mein extract karo
+      3. Har extracted file ke liye:
+           - 2GB check
+           - ffprobe duration (agar video)
+           - send_video / send_document → LEECH_GROUP
+           - copy_message → AUTO_LEECH_CHANNEL
+      4. Temp folder + original ZIP cleanup
+
+    Returns: list of sent Message objects (successful uploads)
+    """
+    title    = post.get("title", "Unknown")
+    sent_msgs = []
+
+    # ── ZIP valid hai? ────────────────────────────────────────────────────────
+    if not zipfile.is_zipfile(zip_path):
+        log.warning(f"    ⚠️ ZIP invalid hai: {zip_path}")
+        await safe_edit(
+            f"⚠️ **ZIP file corrupt ya invalid hai!**\n\n"
+            f"🎬 `{title}` | 🎞️ `{quality}`"
+        )
+        return []
+
+    # ── Extract folder banao ──────────────────────────────────────────────────
+    extract_dir = zip_path + "_extracted"
+    os.makedirs(extract_dir, exist_ok=True)
+
+    try:
+        await safe_edit(
+            f"📦 **ZIP Extract ho raha hai...**\n\n"
+            f"🎬 `{title}` | 🎞️ `{quality}`\n"
+            f"📁 `{os.path.basename(zip_path)}`"
+        )
+
+        # Sync extract — blocking nahi hoga chunki asyncio thread pool mein chalega
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, _extract_zip, zip_path, extract_dir)
+
+        # Extracted files list karo (nested folders bhi handle honge)
+        all_files = []
+        for root, dirs, files in os.walk(extract_dir):
+            # Hidden files skip karo (__MACOSX, .DS_Store, thumbs.db etc.)
+            files = [f for f in files if not f.startswith(".") and f != "Thumbs.db"]
+            dirs[:] = [d for d in dirs if not d.startswith("__") and not d.startswith(".")]
+            for fname in sorted(files):
+                all_files.append(os.path.join(root, fname))
+
+        if not all_files:
+            log.warning("    ZIP mein koi useful file nahi mili")
+            await safe_edit(
+                f"❌ **ZIP empty hai ya sirf hidden files hain!**\n\n"
+                f"🎬 `{title}` | 🎞️ `{quality}`"
+            )
+            return []
+
+        log.info(f"    📂 ZIP mein {len(all_files)} file(s) mili")
+        await safe_edit(
+            f"📂 **ZIP Extract hua!**\n\n"
+            f"🎬 `{title}`\n"
+            f"📄 `{len(all_files)}` file(s) mili\n"
+            f"⏳ Upload shuru..."
+        )
+
+        # ── Har file upload karo ──────────────────────────────────────────────
+        for file_idx, fpath in enumerate(all_files, start=1):
+            fname     = os.path.basename(fpath)
+            fsize     = os.path.getsize(fpath)
+            fsize_str = human_size(fsize)
+
+            log.info(f"    [{file_idx}/{len(all_files)}] ZIP file: {fname} ({fsize_str})")
+
+            # 2GB per-file check
+            if fsize > MAX_FILE_SIZE:
+                log.warning(f"    ⛔ Skip {fname} — {fsize_str} > 2GB")
+                await safe_edit(
+                    f"⛔ **Skip (2GB se badi):**\n"
+                    f"`{fname}` — {fsize_str}\n\n"
+                    f"🎬 `{title}`"
+                )
+                continue
+
+            media_type = detect_media_type("", fname)
+            duration   = 0
+
+            if media_type == "video":
+                await safe_edit(
+                    f"🔍 **Duration check...**\n\n"
+                    f"🎬 `{title}`\n"
+                    f"📄 `{fname}` [{file_idx}/{len(all_files)}]"
+                )
+                duration = await get_video_duration(fpath)
+
+            # Upload progress
+            last_ul = [0.0]
+            ul_start = [time.monotonic()]
+
+            async def on_zip_ul_progress(current: int, total: int):
+                now = time.monotonic()
+                if (now - last_ul[0]) < PROGRESS_UPDATE_INTERVAL:
+                    return
+                last_ul[0] = now
+                elapsed = now - ul_start[0]
+                speed   = current / elapsed if elapsed > 0 else 0
+                eta     = (total - current) / speed if speed > 0 and total > current else 0
+                bar     = make_progress_bar(current, total)
+                await safe_edit(
+                    f"⬆️ **ZIP Upload [{file_idx}/{len(all_files)}]**\n\n"
+                    f"🎬 `{title}`\n"
+                    f"📄 `{fname}`\n"
+                    f"📦 {fsize_str}\n\n"
+                    f"{bar}\n\n"
+                    f"📤 `{human_size(current)}` / `{human_size(total)}`\n"
+                    f"⚡ Speed: `{human_size(int(speed))}/s`\n"
+                    f"⏱️ ETA: `{format_eta(eta)}`"
+                )
+
+            # Caption
+            file_caption = (
+                f"🎬 **{title}**\n\n"
+                f"🎞️ Quality : `{quality}`\n"
+                f"📄 File    : `{fname}`\n"
+                f"📦 Size    : `{fsize_str}`\n"
+                f"[{file_idx}/{len(all_files)}]"
+            )
+
+            common = dict(
+                chat_id=LEECH_GROUP,
+                caption=file_caption,
+                progress=on_zip_ul_progress,
+            )
+
+            ul_start[0] = time.monotonic()
+            sent_msg    = None
+
+            try:
+                if media_type == "video":
+                    sent_msg = await client.send_video(
+                        video=fpath,
+                        duration=duration if duration > 0 else None,
+                        thumb=thumb_path,
+                        supports_streaming=True,
+                        **common,
+                    )
+                elif media_type == "audio":
+                    sent_msg = await client.send_audio(audio=fpath, **common)
+                elif media_type == "gif":
+                    sent_msg = await client.send_animation(animation=fpath, **common)
+                elif media_type == "photo":
+                    sent_msg = await client.send_photo(
+                        photo=fpath,
+                        caption=file_caption,
+                        chat_id=LEECH_GROUP,
+                        progress=on_zip_ul_progress,
+                    )
+                else:
+                    sent_msg = await client.send_document(
+                        document=fpath, file_name=fname, **common
+                    )
+
+                log.info(f"    ✅ ZIP file uploaded: {fname}")
+
+                # AUTO_LEECH_CHANNEL mein copy
+                if sent_msg:
+                    await copy_to_auto_leech_channel(client, sent_msg, file_caption)
+                    sent_msgs.append(sent_msg)
+
+            except Exception as e:
+                log.warning(f"    ❌ ZIP file upload failed [{fname}]: {e}")
+                await safe_edit(
+                    f"❌ **ZIP file upload fail!**\n\n"
+                    f"`{fname}`\n`{str(e)[:150]}`"
+                )
+
+            # Files ke beech thoda gap
+            if file_idx < len(all_files):
+                await asyncio.sleep(2)
+
+    finally:
+        # Cleanup: extracted folder + original ZIP dono hatao
+        try:
+            shutil.rmtree(extract_dir, ignore_errors=True)
+            log.info(f"    🗑️ Extracted folder cleaned: {extract_dir}")
+        except Exception:
+            pass
+
+    return sent_msgs
+
+
+def _extract_zip(zip_path: str, extract_dir: str):
+    """Blocking zip extract — run_in_executor mein chalta hai."""
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        # Path traversal attack se bachao (zip slip)
+        for member in zf.namelist():
+            member_path = os.path.realpath(os.path.join(extract_dir, member))
+            if not member_path.startswith(os.path.realpath(extract_dir)):
+                raise Exception(f"Unsafe ZIP path detected: {member}")
+        zf.extractall(extract_dir)
+
+
 # ─── Single Link Leech ────────────────────────────────────────────────────────
 
 async def leech_one_link(
@@ -346,7 +562,47 @@ async def leech_one_link(
         )
         log.info(f"    ✅ Downloaded: {filename} ({human_size(file_size)})")
 
-        # ── PHASE 2: DURATION (ffprobe) ─────────────────────────────────────
+        # ── PHASE 2: ZIP CHECK ───────────────────────────────────────────────
+        # Agar downloaded file ZIP hai → extract karke sab files upload karo
+        # Normal video/audio/doc flow skip hoga ZIP ke case mein
+        is_zip = (
+            filename.lower().endswith(".zip")
+            or content_type in ("application/zip", "application/x-zip-compressed")
+            or zipfile.is_zipfile(file_path)
+        )
+
+        if is_zip:
+            log.info(f"    🗜️ ZIP detected: {filename} — unzip + upload flow")
+            await safe_edit(
+                f"🗜️ **ZIP file mila!**\n\n"
+                f"🎬 `{title}` | 🎞️ `{quality}`\n"
+                f"📦 Size: `{size}`\n"
+                f"⏳ Extract + Upload shuru hoga..."
+            )
+
+            zip_sent = await handle_zip_upload(
+                client=client,
+                zip_path=file_path,
+                post=post,
+                quality=quality,
+                size=size,
+                thumb_path=thumb_path,
+                safe_edit=safe_edit,
+            )
+
+            # Status message clean karo
+            if status_msg:
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+
+            # file_path already handle_zip_upload ke finally mein delete nahi hoti
+            # (woh sirf extract_dir hatata hai) — yahan hatao
+            # leech_one_link ka finally block bhi try karega — koi issue nahi
+            return len(zip_sent) > 0
+
+        # ── PHASE 3: DURATION (ffprobe) — normal files ke liye ──────────────
         media_type = detect_media_type(content_type, filename)
         duration   = 0
         if media_type == "video":
@@ -357,7 +613,7 @@ async def leech_one_link(
             duration = await get_video_duration(file_path)
             log.info(f"    ⏱️ Duration: {duration}s")
 
-        # ── PHASE 3: UPLOAD → LEECH GROUP mein ─────────────────────────────
+        # ── PHASE 4: UPLOAD → LEECH GROUP mein ─────────────────────────────
         last_update[0] = 0.0
         ul_start = [time.monotonic()]
 
@@ -434,7 +690,7 @@ async def leech_one_link(
         elapsed = time.monotonic() - start_time
         log.info(f"    ✅ Uploaded to Leech Group: {filename} in {elapsed:.1f}s")
 
-        # ── PHASE 4: AUTO LEECH CHANNEL mein copy (without forward tag) ─────
+        # ── PHASE 5: AUTO LEECH CHANNEL mein copy (without forward tag) ─────
         if sent_msg:
             await safe_edit(
                 f"📤 **Auto Leech Channel mein copy ho raha hai...**\n\n"
