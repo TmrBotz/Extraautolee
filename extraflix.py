@@ -78,7 +78,7 @@ def parse_size_mb(size_str: str) -> float:
     '1.57 GB'   → 1607.68
     '11.05 GB'  → 11315.2
     """
-    s = size_str.strip().upper()
+    s = (size_str or "").strip().upper()
     try:
         num = float(re.sub(r"[^\d.]", "", s))
         if "GB" in s:
@@ -138,8 +138,8 @@ async def fetch_latest_posts(session: aiohttp.ClientSession) -> list:
 
     posts = []
     for item in posts_raw:
-        title    = item.get("title", "").strip()
-        post_url = item.get("url", "").strip()
+        title    = (item.get("title") or "").strip()
+        post_url = (item.get("url") or "").strip()
         if not post_url:
             continue
         slug = extract_slug(post_url)
@@ -189,9 +189,9 @@ async def fetch_download_links(session: aiohttp.ClientSession, post_url: str) ->
 
     links = []
     for item in raw_links:
-        file_info = item.get("fileInfo", "").strip()
-        size_str  = item.get("fileSize", "?").strip()
-        url       = item.get("downloadUrl", "").strip()
+        file_info = (item.get("fileInfo") or "").strip()
+        size_str  = (item.get("fileSize") or "?").strip()
+        url       = (item.get("downloadUrl") or "").strip()
 
         if not url:
             continue
